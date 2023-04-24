@@ -211,9 +211,6 @@ func TestPutAndGetKeyValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// wait for a moment for processing message, otherwise get would be failed.
-	// <-time.After(time.Second)
-
 	resp, err := cli.Get(url)
 	if err != nil {
 		t.Fatal(err)
@@ -292,4 +289,61 @@ func TestSnapshot(t *testing.T) {
 	}
 	close(c.applyDoneC)
 	<-clus.snapshotTriggeredC[0]
+}
+
+func TestPutAndGetKeyValueOnPeer(t *testing.T) {
+	var clusters []string
+	for i := 1; i <= 3; i++ {
+		clusters = append(clusters, fmt.Sprintf("http://127.0.0.1:902%d", i))
+		dataDir := fmt.Sprintf("raftexample-%d", i)
+		snapDir := fmt.Sprintf("raftexample-%d-snap", i)
+		os.RemoveAll(dataDir)
+		os.RemoveAll(snapDir)
+		defer func() {
+			os.RemoveAll(dataDir)
+			os.RemoveAll(snapDir)
+		}()
+		proposeC := make(chan *Propose)
+		defer close(proposeC)
+		confChangeC := make(chan raftpb.ConfChange)
+		defer close(confChangeC)
+		var kvs *kvstore
+		getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
+		commitC, errorC, snapshotterReady := newRaftNode(i, clusters, false, getSnapshot, proposeC, confChangeC)
+		kvs = newKVStore(uint16(i), <-snapshotterReady, proposeC, commitC, errorC, wait.New(), idutil.NewGenerator(uint16(i), time.Now()))
+		go serveHttpKVAPI(kvs, 19020+i, confChangeC, errorC)
+	}
+
+	// wait server started
+	<-time.After(time.Second * 3)
+
+	wantKey, wantValue := "test-key", "test-value"
+	url1 := fmt.Sprintf("%s/%s", "http://localhost:19021", wantKey)
+	url2 := fmt.Sprintf("%s/%s", "http://localhost:19022", wantKey)
+	body := bytes.NewBufferString(wantValue)
+
+	req, err := http.NewRequest("PUT", url1, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/html; charset=utf-8")
+	_, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Get(url2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if gotValue := string(data); wantValue != gotValue {
+		t.Errorf("expect %s, got %s", wantValue, gotValue)
+	}
 }
