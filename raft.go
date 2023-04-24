@@ -423,7 +423,10 @@ func (rc *raftNode) serveChannels() {
 					rc.proposeC = nil
 				} else {
 					// blocks until accepted by raft state machine
-					rc.node.Propose(context.TODO(), prop.body)
+					err := rc.node.Propose(context.TODO(), prop.body)
+					if err != nil {
+						log.Printf("nodeId: %d, Propose error: %s", rc.id, err)
+					}
 				}
 
 			case cc, ok := <-rc.confChangeC:
