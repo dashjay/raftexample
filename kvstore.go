@@ -21,25 +21,42 @@ import (
 	"log"
 	"sync"
 
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/wait"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 )
 
+type Propose struct {
+	body []byte
+}
+
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
+	proposeC    chan<- *Propose // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
 	snapshotter *snap.Snapshotter
+
+	reqWait wait.Wait
+	idGen   *idutil.Generator
 }
 
-type kv struct {
-	Key string
-	Val string
+type putReq struct {
+	ReqID uint64
+	Key   string
+	Val   string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+func newKVStore(id uint16, snapshotter *snap.Snapshotter, proposeC chan<- *Propose,
+	commitC <-chan *commit, errorC <-chan error, reqWait wait.Wait, idGen *idutil.Generator) *kvstore {
+	s := &kvstore{
+		proposeC:    proposeC,
+		kvStore:     make(map[string]string),
+		snapshotter: snapshotter,
+		reqWait:     reqWait,
+		idGen:       idGen,
+	}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
@@ -63,13 +80,17 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 }
 
 func (s *kvstore) Propose(k string, v string) {
+	reqID := s.idGen.Next()
+	doneC := s.reqWait.Register(reqID)
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(putReq{ReqID: reqID, Key: k, Val: v}); err != nil {
 		log.Fatal(err)
 	}
-	s.proposeC <- buf.String()
+	s.proposeC <- &Propose{body: buf.Bytes()}
+	<-doneC
 }
 
+// readCommits: kvstore can read commit and error from raft cluster
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 	for commit := range commitC {
 		if commit == nil {
@@ -88,14 +109,17 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 		}
 
 		for _, data := range commit.data {
-			var dataKv kv
-			dec := gob.NewDecoder(bytes.NewBufferString(data))
-			if err := dec.Decode(&dataKv); err != nil {
+			var putReq putReq
+			dec := gob.NewDecoder(bytes.NewBuffer(data))
+			if err := dec.Decode(&putReq); err != nil {
 				log.Fatalf("raftexample: could not decode message (%v)", err)
 			}
 			s.mu.Lock()
-			s.kvStore[dataKv.Key] = dataKv.Val
+			s.kvStore[putReq.Key] = putReq.Val
 			s.mu.Unlock()
+			if putReq.ReqID > 0 {
+				s.reqWait.Trigger(putReq.ReqID, nil)
+			}
 		}
 		close(commit.applyDoneC)
 	}

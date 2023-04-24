@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/wait"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -39,7 +41,7 @@ type cluster struct {
 	peers              []string
 	commitC            []<-chan *commit
 	errorC             []<-chan error
-	proposeC           []chan string
+	proposeC           []chan *Propose
 	confChangeC        []chan raftpb.ConfChange
 	snapshotTriggeredC []<-chan struct{}
 }
@@ -55,7 +57,7 @@ func newCluster(n int) *cluster {
 		peers:              peers,
 		commitC:            make([]<-chan *commit, len(peers)),
 		errorC:             make([]<-chan error, len(peers)),
-		proposeC:           make([]chan string, len(peers)),
+		proposeC:           make([]chan *Propose, len(peers)),
 		confChangeC:        make([]chan raftpb.ConfChange, len(peers)),
 		snapshotTriggeredC: make([]<-chan struct{}, len(peers)),
 	}
@@ -63,7 +65,7 @@ func newCluster(n int) *cluster {
 	for i := range clus.peers {
 		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
 		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
-		clus.proposeC[i] = make(chan string, 1)
+		clus.proposeC[i] = make(chan *Propose, 1)
 		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
 		fn, snapshotTriggeredC := getSnapshotFn()
 		clus.snapshotTriggeredC[i] = snapshotTriggeredC
@@ -110,17 +112,17 @@ func TestProposeOnCommit(t *testing.T) {
 	donec := make(chan struct{})
 	for i := range clus.peers {
 		// feedback for "n" committed entries, then update donec
-		go func(pC chan<- string, cC <-chan *commit, eC <-chan error) {
+		go func(idx int, pC chan<- *Propose, cC <-chan *commit, eC <-chan error) {
 			for n := 0; n < 100; n++ {
-				c, ok := <-cC
+				_, ok := <-cC
 				if !ok {
 					pC = nil
 				}
 				select {
-				case pC <- c.data[0]:
+				case pC <- &Propose{[]byte(fmt.Sprintf("%d-foo-%d", idx, n))}:
 					continue
 				case err := <-eC:
-					t.Errorf("eC message (%v)", err)
+					t.Errorf("%d-eC message (%v)", idx, err)
 				}
 			}
 			donec <- struct{}{}
@@ -128,11 +130,11 @@ func TestProposeOnCommit(t *testing.T) {
 				// acknowledge the commits from other nodes so
 				// raft continues to make progress
 			}
-		}(clus.proposeC[i], clus.commitC[i], clus.errorC[i])
+		}(i, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
 
 		// one message feedback per node
-		go func(i int) { clus.proposeC[i] <- "foo" }(i)
 	}
+	go func(i int) { clus.proposeC[i] <- &Propose{[]byte("foo")} }(0)
 
 	for range clus.peers {
 		<-donec
@@ -149,25 +151,31 @@ func TestCloseProposerBeforeReplay(t *testing.T) {
 // TestCloseProposerInflight tests closing the producer while
 // committed messages are being published to the client.
 func TestCloseProposerInflight(t *testing.T) {
-	clus := newCluster(1)
+	clus := newCluster(3)
 	defer clus.closeNoErrors(t)
 
 	// some inflight ops
 	go func() {
-		clus.proposeC[0] <- "foo"
-		clus.proposeC[0] <- "bar"
+		clus.proposeC[0] <- &Propose{[]byte("foo")}
+		clus.proposeC[0] <- &Propose{[]byte("bar")}
 	}()
 
 	// wait for one message
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.commitC[1]; !ok || !bytes.Equal(c.data[0], []byte("foo")) {
 		t.Fatalf("Commit failed")
 	}
 }
 
 func TestPutAndGetKeyValue(t *testing.T) {
+	os.RemoveAll("raftexample-1")
+	os.RemoveAll("raftexample-1-snap")
+	defer func() {
+		os.RemoveAll("raftexample-1")
+		os.RemoveAll("raftexample-1-snap")
+	}()
 	clusters := []string{"http://127.0.0.1:9021"}
 
-	proposeC := make(chan string)
+	proposeC := make(chan *Propose)
 	defer close(proposeC)
 
 	confChangeC := make(chan raftpb.ConfChange)
@@ -177,7 +185,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
 	commitC, errorC, snapshotterReady := newRaftNode(1, clusters, false, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	kvs = newKVStore(1, <-snapshotterReady, proposeC, commitC, errorC, wait.New(), idutil.NewGenerator(1, time.Now()))
 
 	srv := httptest.NewServer(&httpKVAPI{
 		store:       kvs,
@@ -204,7 +212,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	}
 
 	// wait for a moment for processing message, otherwise get would be failed.
-	<-time.After(time.Second)
+	// <-time.After(time.Second)
 
 	resp, err := cli.Get(url)
 	if err != nil {
@@ -241,7 +249,7 @@ func TestAddNewNode(t *testing.T) {
 		Context: []byte(newNodeURL),
 	}
 
-	proposeC := make(chan string)
+	proposeC := make(chan *Propose)
 	defer close(proposeC)
 
 	confChangeC := make(chan raftpb.ConfChange)
@@ -250,10 +258,10 @@ func TestAddNewNode(t *testing.T) {
 	newRaftNode(4, append(clus.peers, newNodeURL), true, nil, proposeC, confChangeC)
 
 	go func() {
-		proposeC <- "foo"
+		proposeC <- &Propose{[]byte("foo")}
 	}()
 
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.commitC[0]; !ok || !bytes.Equal(c.data[0], []byte("foo")) {
 		t.Fatalf("Commit failed")
 	}
 }
@@ -272,7 +280,7 @@ func TestSnapshot(t *testing.T) {
 	defer clus.closeNoErrors(t)
 
 	go func() {
-		clus.proposeC[0] <- "foo"
+		clus.proposeC[0] <- &Propose{[]byte("foo")}
 	}()
 
 	c := <-clus.commitC[0]

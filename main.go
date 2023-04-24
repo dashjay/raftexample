@@ -17,7 +17,10 @@ package main
 import (
 	"flag"
 	"strings"
+	"time"
 
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/wait"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -28,7 +31,7 @@ func main() {
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
-	proposeC := make(chan string)
+	proposeC := make(chan *Propose)
 	defer close(proposeC)
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
@@ -38,7 +41,7 @@ func main() {
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
 	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	kvs = newKVStore(uint16(*id), <-snapshotterReady, proposeC, commitC, errorC, wait.New(), idutil.NewGenerator(uint16(*id), time.Now()))
 
 	// the key-value http handler will propose updates to raft
 	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)

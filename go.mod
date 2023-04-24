@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	go.etcd.io/etcd/client/pkg/v3 v3.5.4
+	go.etcd.io/etcd/pkg/v3 v3.5.4
 	go.etcd.io/etcd/raft/v3 v3.5.4
 	go.etcd.io/etcd/server/v3 v3.5.4
 	go.uber.org/zap v1.23.0
@@ -23,7 +24,6 @@ require (
 	github.com/prometheus/procfs v0.6.0 // indirect
 	github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.4 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.5.4 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
 	golang.org/x/sys v0.0.0-20220708085239-5a0f0661e09d // indirect
